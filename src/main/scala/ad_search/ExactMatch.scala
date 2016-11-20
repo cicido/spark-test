@@ -1,26 +1,20 @@
 package ad_search
 
-import java.util.{List => JList}
-
 import com.hankcs.hanlp.HanLP
 import com.hankcs.hanlp.seg.common.{Term => HanLPTerm}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.{DataFrame, Row, SQLContext}
 import org.apache.spark.sql.hive.HiveContext
-import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
-import scala.collection.mutable.{Set => MuSet}
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
+import org.apache.spark.sql.{DataFrame, Row, SQLContext}
+import org.apache.spark.{SparkConf, SparkContext}
+
 import scala.collection.JavaConversions._
+import scala.collection.mutable.{ArrayBuffer, Set => MuSet}
 
 /*
 author: duanxiping@meizu.com
 date: 2016-10-08
 file: ExactMatch.scala
  */
-
-class ExactMatch {
-
-}
 
 object ExactMatch {
   val bid_table: String = "ad_recommend.bdl_t_poster_cat_mapping"
@@ -29,10 +23,11 @@ object ExactMatch {
   val exact_include_table: String = "default.dxp_exact_include_word_count"
   val syno_include_table: String = "default.dxp_syno_include_word_count"
   val core_include_table: String = "default.dxp_core_include_word_count"
+  val query_bid_word_table: String = "default.dxp_query_bid_word_data"
 
-  var hiveContext: HiveContext = _
-  var sc: SparkContext = _
-  var sqlContext: SQLContext = _
+  var hiveContext: HiveContext = null
+  var sc: SparkContext = null
+  var sqlContext: SQLContext = null
 
   def initSpark(appname: String): Unit = {
     val sparkConf: SparkConf = new SparkConf().setAppName(appname)
@@ -60,12 +55,90 @@ object ExactMatch {
       case "exact-include" => getExactIncludePVR(bid_word_df, search_word_df, exact_include_table, pdate)
       case "syno-include" => getSynoIncludePVR(bid_word_df, search_word_df, syno_include_table, pdate)
       case "core-include" => getCoreIncludePVR(bid_word_df, search_word_df, core_include_table, pdate)
+      case "get-data" => getWordPair(bid_word_df,search_word_df,query_bid_word_table, pdate)
     }
   }
 
   /*
   getExactMatchPVR
    */
+
+  def segMsg(msg: String): MuSet[String] = {
+    val wordSet = MuSet.empty[String]
+    for (term: HanLPTerm <- HanLP.segment(msg)) {
+      wordSet += term.word
+    }
+    wordSet
+  }
+
+  def getWordPair(bid_word_df: DataFrame, search_word_df: DataFrame, output_table:String, pdate:Long){
+    val bid_word_arr: Array[(String, MuSet[String])] = bid_word_df.rdd.
+      map(r => {
+        val wordSet = MuSet.empty[String]
+        val sen: String = r.getAs[String]("bid_word")
+        for (term: HanLPTerm <- HanLP.segment(sen)) {
+          wordSet += term.word
+        }
+        (sen, wordSet)
+      }).collect()
+
+    val join_include_rdd = search_word_df.rdd.repartition(500).map(r=>{
+      val bidarr: ArrayBuffer[(String,Int)] =  new ArrayBuffer[(String, Int)]()
+      val sen:String = r.getAs[String]("search_word")
+      val querySet:MuSet[String] = segMsg(sen)
+
+      for(i <- 0 until bid_word_arr.length) {
+        val bidSet:MuSet[String] = bid_word_arr(i)._2
+        val bidStr:String = bid_word_arr(i)._1
+        val diffSet: MuSet[String] = querySet & bidSet
+        if (sen == bidStr) {
+          bidarr.append((bidStr, 1))
+        } else {
+          if (sen.contains(bidStr))
+            bidarr.append((bidStr, 2))
+          if (diffSet.size == bidSet.size){
+            bidarr.append((bidStr, 3))
+          }else if(diffSet.size > 0 && diffSet.size == bidSet.size -1){
+            bidarr.append((bidStr,4))
+          }
+        }
+      }
+
+      //self define format
+      val res:String = if(bidarr.length == 0) "" else bidarr.map(r=>{
+        r._1 + "," + r._2
+      }).mkString(" ")
+
+      /*
+      //json format
+      import org.json4s.JsonDSL._
+      import org.json4s.jackson.JsonMethods._
+      val jsonObj = ("bidlist" -> bidarr.toList.map(r=>{
+        (("word"->r._1) ~("tag" ->r._2))
+      }))
+      val jsonStr:String = if(bidarr.length == 0) "" else compact(render(jsonObj))
+      */
+
+      Row(sen,res)
+    })
+
+    //print data
+    val st = StructType(
+      StructField("queryword", StringType, false) ::
+        StructField("bidlist", StringType, true) :: Nil)
+
+    val tmptable: String = "dxp_tmp_table"
+    hiveContext.createDataFrame(join_include_rdd, st).registerTempTable(tmptable)
+
+    val create_table_sql: String = s"create table if not exists $output_table " +
+      "(search_word string,bidlist string) partitioned by (stat_date bigint) stored as textfile"
+    hiveContext.sql(create_table_sql)
+
+    val insert_sql: String = s"insert overwrite table $output_table partition(stat_date = $pdate) " +
+      s"select * from $tmptable"
+    hiveContext.sql(insert_sql)
+
+  }
   def getExactMatchPVR(bid_word_df: DataFrame, search_word_df: DataFrame, output_table: String, pdate: Long) = {
     //import hiveContext.implicits._
     // get all search word
@@ -227,7 +300,6 @@ object ExactMatch {
     println(time_range)
     time_range
   }
-
 
   def getBidWordData(tbname: String, sdate: Long, edate: Long): DataFrame = {
     val time_range: String = getTimeStr(sdate, edate)
