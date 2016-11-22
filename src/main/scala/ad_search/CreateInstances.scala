@@ -1,11 +1,12 @@
 package ad_search
 
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.{DataFrame, SQLContext}
-import org.apache.spark.sql.hive.HiveContext
-import org.apache.spark.sql.functions._
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.{DataFrame, SQLContext}
+import org.apache.spark.{SparkConf, SparkContext}
+import scala.collection.mutable
 
 /**
   * Created by duanxiping on 2016/11/15.
@@ -14,6 +15,7 @@ object CreateInstances {
   var hiveContext: HiveContext = null
   var sc: SparkContext = null
   var sqlContext: SQLContext = null
+  val featureMap = new mutable.HashMap[String,Map[String,Int]]()
 
   def initSpark(appname: String): Unit = {
     val sparkConf: SparkConf = new SparkConf().setAppName(appname)
@@ -49,7 +51,6 @@ object CreateInstances {
       case "get-data" => getWordPair(bid_word_df, search_word_df, query_bid_word_table, pdate)
     }
     */
-
   }
 
   def makeTestData(): DataFrame = {
@@ -61,40 +62,52 @@ object CreateInstances {
     )).toDF("id", "age", "sex")
   }
 
-  //feature data Map, 可以改成从数据中获取(以后再做)
-  val featureMap = Map("age" -> Map("young" -> 0, "old" -> 1),
-    "sex" -> Map("male" -> 0, "female" -> 1))
-
-
+  //转为cat_id,不做one-hot,以便用于其他非LR算法
   def oneColProcess(col: String) = (df: DataFrame) => {
-    //may throw key error
-    val catMap = featureMap(col)
-    val stringToDouble = udf[Double, String] { w =>
-      if (catMap.contains(w)) catMap(w) else catMap.size
+    val catMap = df.select(col).distinct.map(_.getAs[String](col)).collect.zipWithIndex.toMap
+    featureMap(col) = catMap
+    val stringToDouble = udf[Double, String] {
+      catMap(_)
     }
     df.withColumn(col+"_cat", stringToDouble(df(col)))
   }
 
+  //one-hot编码
   def oneColProcessWithOneHot(col:String) = (df:DataFrame) => {
-    //may throw key error
-    val catMap = featureMap(col)
+    val catMap = df.select(col).distinct.map(_.getAs[String](col)).collect.zipWithIndex.toMap
+    featureMap(col) = catMap
     val stringToVector = udf[Vector, String] { w =>
-      val idx = if (catMap.contains(w)) catMap(w) else catMap.size
-      Vectors.sparse(catMap.size+1, Array(idx),Array(1))
+      Vectors.sparse(catMap.size, Array(catMap(w)),Array(1))
     }
     df.withColumn(col+"_cat", stringToVector(df(col)))
   }
 
+  //对于非cat类型的字段进行分段处理
+  def oneColProcessWithSplit(col:String) = (df:DataFrame) =>{
+    //分段范围计算
+    val col_range = Array(1,3,5)
+    val splitToDouble = udf[Double, Double] { w =>
+      var i = 0
+      while(i < col_range.length && w < col_range(i)){
+        i += 1
+      }
+      i.toDouble
+    }
+    df.withColumn(col+"_cat", splitToDouble(df(col)))
+  }
+
   def multiColProcess(df: DataFrame,label:String, needOneHot:Boolean): DataFrame = {
-    val cols = df.columns
+    val cols = df.columns.filter(_ != label)
     var new_df = df
     if(needOneHot){
-      for (col <- cols if col != label) {
+      for (col <- cols) {
         new_df = oneColProcessWithOneHot(col)(new_df)
+        new_df.drop(col)
       }
     }else{
-      for (col <- cols if col != label) {
+      for (col <- cols) {
         new_df = oneColProcess(col)(new_df)
+        new_df.drop(col)
       }
     }
     new_df
@@ -110,14 +123,22 @@ object CreateInstances {
   }
 
   //get imei data
+  //tbname:user_profile.idl_fdt_dw_tag
   def getImeiData(tbname: String, sdate: Long, edate: Long): DataFrame = {
-    val select_sql = ""
+    /*
+    val select_sql = "select user_age, sex, user_job,marriage_status,mz_apps_car_owner,user_network_type,user_life_city_lev," +
+        "wifi_user_active,recharge_way_30d,mzpay_bind_bank_flag,dev_operator," +
+        s"user_dev_price,user_os_type from $tbname"
+    */
+    val select_sql = "select user_age, sex, user_job,marriage_status,mz_apps_car_owner,user_network_type " +
+      s"from $tbname"
     hiveContext.sql(select_sql)
   }
 
   //get app data
+  //tbname: app_center.dim_application_info_d_all
   def getAppData(tbname: String, sdate: Long, edate: Long): DataFrame = {
-    val select_sql = ""
+    val select_sql = "select category_id,"
     hiveContext.sql(select_sql)
   }
 
