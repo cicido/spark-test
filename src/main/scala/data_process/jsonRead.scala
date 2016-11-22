@@ -16,7 +16,7 @@ object jsonRead{
   var sc: SparkContext = null
   var sqlContext: SQLContext = null
   val srcTable = "ad_recommend.odl_cpd_search_ad"
-  val dstTable = "ad_recommend.odl_cpd_search_ad_unjson"
+  val dstTable = "algo.odl_cpd_search_ad_unjson"
   def main(args: Array[String]): Unit = {
     initSpark("AdSearch-RevJson")
     val dt = args(0).toLong
@@ -90,7 +90,7 @@ object jsonRead{
   }
 
   def getData(tbname:String, dt:BigInt): DataFrame ={
-    val select_sql = "select * from $tbname where stat_date =$dt limit 1000"
+    val select_sql = s"select * from $tbname where stat_date =$dt"
     hiveContext.sql(select_sql)
   }
 
@@ -149,13 +149,16 @@ object jsonRead{
         case e: JSONException => e.printStackTrace()
       }
       data
-    }).map(Row(_))
+    }).map(r=>Row(r(0),r(1),r(2),r(3),r(4),r(5),r(6),r(7),r(8),r(9),
+      r(10),r(11),r(12),r(13),r(14),r(15),r(16),r(17),r(18),
+      r(19),r(20),r(21)))
+
     val tmptable = "dxp_tmp_table"
     hiveContext.createDataFrame(revRdd, schema).registerTempTable(tmptable)
 
     val cols_string = all_cols.map(r=>r+" string").mkString(",")
     val create_table_sql: String = s"create table if not exists $tbname " +
-      "($cols_string) partitioned by (stat_date bigint) stored as textfile"
+      s"($cols_string) partitioned by (stat_date bigint) stored as textfile"
     hiveContext.sql(create_table_sql)
 
     val insert_sql: String = s"insert overwrite table $tbname partition(stat_date = $dt) " +
