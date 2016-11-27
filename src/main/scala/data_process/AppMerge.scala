@@ -20,7 +20,6 @@ object AppMerge{
 
     val dstTable = "ad_recommend.bdl_fdt_app_application_ad"
 
-
     mergeData(srcTables,dt,dstTable)
   }
 
