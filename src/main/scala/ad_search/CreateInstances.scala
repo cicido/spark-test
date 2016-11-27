@@ -6,9 +6,9 @@ import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType}
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.{SparkConf, SparkContext}
-import sun.util.resources.cldr.lag.CalendarData_lag_TZ
 
 import scala.collection.mutable
 
@@ -22,6 +22,8 @@ object CreateInstances {
   val featureMap = new mutable.HashMap[String, Map[String, Int]]()
 
   def initSpark(appname: String): Unit = {
+    System.setProperty("user.name", "ad_recommend")
+    System.setProperty("HADOOP_USER_NAME", "ad_recommend")
     val sparkConf: SparkConf = new SparkConf().setAppName(appname)
     sc = new SparkContext(sparkConf)
     sc.hadoopConfiguration.set("mapred.output.compress", "false")
@@ -31,25 +33,23 @@ object CreateInstances {
 
   def main(args: Array[String]): Unit = {
     initSpark("AdSearch-algo")
-    val mtype = args(0)
-    val sdate = args(1).toLong
-    val edate = args(2).toLong
-    val pdate = args(3).toLong
+    val dt = args(0).toLong
 
-    //get hive table data
-    val bid_word_df: DataFrame = getBidWordData(bid_table, 0, edate)
-    val search_word_df: DataFrame = getSearchWordData(search_table, sdate, edate)
-    println("bid_word_df.size:" + bid_word_df.count())
-    println("search_word_df.size:" + search_word_df.count())
+    val imeiTable = "user_profile.idl_fdt_dw_tag"
+    val appTable = "ad_recommend.bdl_fdt_app_application_ad"
+    val eventTable = "ad_recommend.bdl_fdt_appcenter_ad_cpd_log"
 
-    //computing pvr according to the mtype
-    mtype match {
-      case "exact-match" => getExactMatchPVR(bid_word_df, search_word_df, exact_match_table, pdate)
-      case "exact-include" => getExactIncludePVR(bid_word_df, search_word_df, exact_include_table, pdate)
-      case "syno-include" => getSynoIncludePVR(bid_word_df, search_word_df, syno_include_table, pdate)
-      case "core-include" => getCoreIncludePVR(bid_word_df, search_word_df, core_include_table, pdate)
-      case "get-data" => getWordPair(bid_word_df, search_word_df, query_bid_word_table, pdate)
-    }
+    val outImeiTable = "ad_recommend.dxp_ad_search_imei_data"
+    val outAppTable = "ad_recommend.dxp_ad_search_app_data"
+    val outEventTable = "ad_recommend.dxp_ad_search_event_data"
+    val ModuelFile = "ad_search_model"
+
+    val imeiDF = getImeiData(imeiTable)
+    saveDataFrame(imeiDF,outImeiTable,dt)
+    val appDF =  getAppData(appTable,dt)
+    saveDataFrame(appDF,outAppTable,dt)
+    val eventDF = getEventData(eventTable,dt)
+    saveDataFrame(eventDF, outEventTable,dt)
   }
 
   def makeTestData(): DataFrame = {
@@ -74,12 +74,29 @@ object CreateInstances {
 
   //one-hot编码
   def oneColProcessWithOneHot(col: String) = (df: DataFrame) => {
-    val catMap = df.select(col).distinct.map(_.getAs[String](col)).collect.zipWithIndex.toMap
-    featureMap(col) = catMap
-    val stringToVector = udf[Vector, String] { w =>
-      Vectors.sparse(catMap.size, Array(catMap(w)), Array(1))
+    val sma = df.schema
+    val catMap = sma(col).dataType match {
+      case IntegerType => df.select(col).distinct.map(_.getAs[Int](col).toString).collect.zipWithIndex.toMap
+      case LongType => df.select(col).distinct.map(_.getAs[Long](col).toString).collect.zipWithIndex.toMap
+      case StringType => df.select(col).distinct.map(_.getAs[String](col)).collect.zipWithIndex.toMap
+      case BooleanType => df.select(col).distinct.map(_.getAs[Boolean](col).toString).collect.zipWithIndex.toMap
     }
-    df.withColumn(col + "_cat", stringToVector(df(col)))
+    println(catMap)
+
+    val typeToVector = sma(col).dataType match {
+      case IntegerType => udf[Vector, Int] { w =>
+        Vectors.sparse(catMap.size, Array(catMap(w.toString)), Array(1))
+      }
+      case LongType => udf[Vector, Long] { w =>
+        Vectors.sparse(catMap.size, Array(catMap(w.toString)), Array(1))
+      }
+      case StringType => udf[Vector, String] { w =>
+        Vectors.sparse(catMap.size, Array(catMap(w)), Array(1))
+      }
+      case BooleanType => udf[Vector, Boolean] { w =>
+      Vectors.sparse(catMap.size, Array(catMap(w.toString)), Array(1))
+    }
+    df.withColumn(col + "_cat", typeToVector(df(col)))
     df.drop(col)
   }
 
@@ -122,9 +139,34 @@ object CreateInstances {
     assembler.transform(df).select(label, "features")
   }
 
+  def saveDataFrame(df:DataFrame,outTable:String,dt:Long): Unit ={
+    val cols = df.columns
+    val sma = df.schema
+    val colsType = cols.map(r=>{
+      sma(r).dataType match {
+        case IntegerType => "int"
+        case LongType => "bigint"
+        case StringType => "string"
+        case BooleanType => "boolean"
+      }
+    })
+
+    val colsString = cols.zip(colsType).map(r=>r._1 + " " + r._2).mkString(",")
+    val create_table_sql: String = s"create table if not exists $outTable " +
+      s" ($colsString) partitioned by (stat_date bigint) stored as textfile"
+    hiveContext.sql(create_table_sql)
+
+    val tmptable = "dxp_tmp_table"
+    df.registerTempTable(tmptable)
+
+    val insert_sql: String = s"insert overwrite table $outTable partition(stat_date = $dt) " +
+      s"select * from $tmptable"
+    hiveContext.sql(insert_sql)
+    hiveContext.dropTempTable(tmptable)
+  }
   //get imei data
   //tbname:user_profile.idl_fdt_dw_tag
-  def getImeiData(tbname: String, dt: Long): DataFrame = {
+  def getImeiData(tbname: String): DataFrame = {
     /*
     val cols = Array("user_age", "sex", "user_job", "marriage_status", "mz_apps_car_owner",
       "user_network_type","user_life_city_lev", "wifi_user_active","recharge_way_30d",
@@ -138,7 +180,6 @@ object CreateInstances {
   }
 
   //get app data
-  //tbname: app_center.dim_application_info_d_all
   def getAppData(tbname: String, dt: Long): DataFrame = {
     //tbname: bdl_fdt_app_application_ad
     val label = "appid"
@@ -180,7 +221,7 @@ object CreateInstances {
       w match {
         case "AD_MQ_EVENT_CPD_EXPOSE" => 0
         case "AD_MQ_EVENT_CPD_DETAIL" => 1
-        case "AD_MQ_EVENT_CPD_INSTALL" => 2
+        case "AD_MQ_EVENT_CPD_INSTALL" => 1
         case _ => -1
       }
     }
@@ -209,11 +250,5 @@ object CreateInstances {
     df.withColumn("day_of_week",getWeek(df("oper_time")))
     df.withColumn("hour_of_day",getHour(df("oper_time")))
     df.drop("oper_time")
-
-    val new_cols = Array("imei", "app_id", "oper_type_cat","day_of_week","hour_of_day")
-    val tmptable = "dxp_tmp_table"
-    df.registerTempTable(tmptable)
-
-    df
   }
 }
