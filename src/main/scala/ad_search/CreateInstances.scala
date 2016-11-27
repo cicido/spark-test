@@ -1,11 +1,15 @@
 package ad_search
 
+import java.util.Calendar
+
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.{SparkConf, SparkContext}
+import sun.util.resources.cldr.lag.CalendarData_lag_TZ
+
 import scala.collection.mutable
 
 /**
@@ -15,7 +19,7 @@ object CreateInstances {
   var hiveContext: HiveContext = null
   var sc: SparkContext = null
   var sqlContext: SQLContext = null
-  val featureMap = new mutable.HashMap[String,Map[String,Int]]()
+  val featureMap = new mutable.HashMap[String, Map[String, Int]]()
 
   def initSpark(appname: String): Unit = {
     val sparkConf: SparkConf = new SparkConf().setAppName(appname)
@@ -27,10 +31,6 @@ object CreateInstances {
 
   def main(args: Array[String]): Unit = {
     initSpark("AdSearch-algo")
-    val df = makeTestData()
-    val new_df = multiColProcess(df,"id",true)
-    new_df.write.format("json").save("file:///opt/test.json")
-    /*
     val mtype = args(0)
     val sdate = args(1).toLong
     val edate = args(2).toLong
@@ -50,7 +50,6 @@ object CreateInstances {
       case "core-include" => getCoreIncludePVR(bid_word_df, search_word_df, core_include_table, pdate)
       case "get-data" => getWordPair(bid_word_df, search_word_df, query_bid_word_table, pdate)
     }
-    */
   }
 
   def makeTestData(): DataFrame = {
@@ -69,99 +68,152 @@ object CreateInstances {
     val stringToDouble = udf[Double, String] {
       catMap(_)
     }
-    df.withColumn(col+"_cat", stringToDouble(df(col)))
+    df.withColumn(col + "_cat", stringToDouble(df(col)))
+    df.drop(col)
   }
 
   //one-hot编码
-  def oneColProcessWithOneHot(col:String) = (df:DataFrame) => {
+  def oneColProcessWithOneHot(col: String) = (df: DataFrame) => {
     val catMap = df.select(col).distinct.map(_.getAs[String](col)).collect.zipWithIndex.toMap
     featureMap(col) = catMap
     val stringToVector = udf[Vector, String] { w =>
-      Vectors.sparse(catMap.size, Array(catMap(w)),Array(1))
+      Vectors.sparse(catMap.size, Array(catMap(w)), Array(1))
     }
-    df.withColumn(col+"_cat", stringToVector(df(col)))
+    df.withColumn(col + "_cat", stringToVector(df(col)))
+    df.drop(col)
   }
 
   //对于非cat类型的字段进行分段处理
-  def oneColProcessWithSplit(col:String) = (df:DataFrame) =>{
+  def oneColProcessWithSplit(col: String, colRange: Array[Long]) = (df: DataFrame) => {
     //分段范围计算
-    val col_range = Array(1,3,5)
     val splitToDouble = udf[Double, Double] { w =>
       var i = 0
-      while(i < col_range.length && w < col_range(i)){
+      while (i < colRange.length && w < colRange(i)) {
         i += 1
       }
       i.toDouble
     }
-    df.withColumn(col+"_cat", splitToDouble(df(col)))
+    df.withColumn(col + "_split", splitToDouble(df(col)))
   }
 
-  def multiColProcess(df: DataFrame,label:String, needOneHot:Boolean): DataFrame = {
+
+  def multiColProcess(df: DataFrame, label: String, needOneHot: Boolean): DataFrame = {
     val cols = df.columns.filter(_ != label)
     var new_df = df
-    if(needOneHot){
+    if (needOneHot) {
       for (col <- cols) {
         new_df = oneColProcessWithOneHot(col)(new_df)
-        new_df.drop(col)
       }
-    }else{
+    } else {
       for (col <- cols) {
         new_df = oneColProcess(col)(new_df)
-        new_df.drop(col)
       }
     }
     new_df
   }
 
+
   //get train data
-  def assembleFeatures(df:DataFrame, label:String):DataFrame = {
+  def assembleFeatures(df: DataFrame, label: String): DataFrame = {
     val cols = df.columns
     val assembler = new VectorAssembler().
       setInputCols(cols.filter(_ != label)).
       setOutputCol("features")
-    assembler.transform(df).select(label,"features")
+    assembler.transform(df).select(label, "features")
   }
 
   //get imei data
   //tbname:user_profile.idl_fdt_dw_tag
-  def getImeiData(tbname: String, sdate: Long, edate: Long): DataFrame = {
+  def getImeiData(tbname: String, dt: Long): DataFrame = {
     /*
-    val select_sql = "select user_age, sex, user_job,marriage_status,mz_apps_car_owner,user_network_type,user_life_city_lev," +
-        "wifi_user_active,recharge_way_30d,mzpay_bind_bank_flag,dev_operator," +
-        s"user_dev_price,user_os_type from $tbname"
-    */
-    val select_sql = "select user_age, sex, user_job,marriage_status,mz_apps_car_owner,user_network_type " +
-      s"from $tbname"
-    hiveContext.sql(select_sql)
+    val cols = Array("user_age", "sex", "user_job", "marriage_status", "mz_apps_car_owner",
+      "user_network_type","user_life_city_lev", "wifi_user_active","recharge_way_30d",
+      "mzpay_bind_bank_flag","dev_operator")
+      */
+    val label = "imei"
+    val cols = Array("user_age", "sex", "user_job", "marriage_status", "mz_apps_car_owner", "user_network_type")
+    val colsString = label + "," + cols.mkString(",")
+    val selectSQL = s"select $colsString from $tbname"
+    multiColProcess(hiveContext.sql(selectSQL), label, true)
   }
 
   //get app data
   //tbname: app_center.dim_application_info_d_all
-  def getAppData(tbname: String, sdate: Long, edate: Long): DataFrame = {
-    val select_sql = "select category_id,"
-    hiveContext.sql(select_sql)
+  def getAppData(tbname: String, dt: Long): DataFrame = {
+    //tbname: bdl_fdt_app_application_ad
+    val label = "appid"
+    val catCols = Array("fcategoryid", "fcategory2id")
+    val splitCols = Array("fevaluate_count", "fdownload_count", "fstars", "finstall_count", "appsize")
+    val splitRanges: Array[Array[Long]] = Array(Array(100, 1000, 10000, 100000), Array(1000, 10000, 100000, 1000000),
+      Array(1000, 10000, 100000, 1000000), Array(1000, 10000, 100000), Array(102400, 1024000, 1024000, 10240000))
+
+    val colsString = (Array(label) ++ catCols ++ splitCols).mkString(",")
+    val selectSQL = s"select $colsString from $tbname where stat_date=$dt"
+    var df = hiveContext.sql(selectSQL)
+
+    val splitColsRanges = splitCols.zip(splitRanges)
+    for (col <- splitColsRanges) {
+      oneColProcessWithSplit(col._1, col._2)(df)
+      df.drop(col._1)
+    }
+
+    val resSplitCols = splitCols.map(_ + "_split")
+    val cols = catCols ++ resSplitCols
+
+    for (col <- cols) {
+      oneColProcessWithOneHot(col)(df)
+      df.drop(col)
+    }
+    df
   }
 
   //get event data
-  def getEventData(tbname: String, sdate: Long, edate: Long): DataFrame = {
-    val select_sql = ""
-    hiveContext.sql(select_sql)
-  }
+  def getEventData(tbname: String, dt: Long): DataFrame = {
+    //tbname:bdl_fdt_appcenter_ad_cpd_log
+    val cols = Array("imei", "app_id", "oper_type", "oper_time")
+    val colsString = cols.mkString(",")
 
-  /*
-    sdate: start date
-    edate: end date
-    get the time range string
-  */
-  def getTimeStr(sdate: Long, edate: Long): String = {
-    val time_range: String = (sdate, edate) match {
-      case (0, 0) => ""
-      case (0, edt) => s" stat_date < $edt "
-      case (sdt, 0) => s" stat_date >=$sdt "
-      case (sdt, edt) => s" stat_date >= $sdt and stat_date < $edt "
+    val selectSQL = s"select $colsString from $tbname " +
+      s" where stat_date=$dt and tracker_type = 2"
+
+    val stringToDouble = udf[Double, String] { w =>
+      w match {
+        case "AD_MQ_EVENT_CPD_EXPOSE" => 0
+        case "AD_MQ_EVENT_CPD_DETAIL" => 1
+        case "AD_MQ_EVENT_CPD_INSTALL" => 2
+        case _ => -1
+      }
     }
-    println(time_range)
-    time_range
-  }
 
+    var cal = Calendar.getInstance()
+    val getWeek = udf[Double, Long] { w =>
+      cal.setTimeInMillis(w)
+      cal.get(Calendar.DAY_OF_WEEK)
+    }
+
+    val getHour = udf[Double, Long] { w =>
+      cal.setTimeInMillis(w)
+      cal.get(Calendar.HOUR_OF_DAY) match {
+        case i if List(2,3,4,5,6,7).contains(i) => 0
+        case i if List(8,9,10,11,12,13).contains(i) => 1
+        case i if List(14,15,16,17,18,19).contains(i) => 2
+        case i if List(20,21,22,23,0,1).contains(i) => 3
+        case _ => 4
+      }
+    }
+
+    var df = hiveContext.sql(selectSQL)
+    df.withColumn("oper_type_cat", stringToDouble(df("oper_type")))
+    df.drop("oper_type")
+
+    df.withColumn("day_of_week",getWeek(df("oper_time")))
+    df.withColumn("hour_of_day",getHour(df("oper_time")))
+    df.drop("oper_time")
+
+    val new_cols = Array("imei", "app_id", "oper_type_cat","day_of_week","hour_of_day")
+    val tmptable = "dxp_tmp_table"
+    df.registerTempTable(tmptable)
+
+    df
+  }
 }
